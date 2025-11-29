@@ -5,7 +5,6 @@ import datetime
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from dotenv import load_dotenv
 import requests
 from flask import Flask, request, jsonify, Response
 
@@ -13,7 +12,6 @@ import redis
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
-load_dotenv()
 # ---------------------------------------------------------
 # Configuration & Setup
 # ---------------------------------------------------------
