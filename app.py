@@ -42,7 +42,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
     # Your existing DeepSeek V3.1 mapping
     "smars/smars-1": {
         "openrouter": os.environ.get(
-            "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1"
+            "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free"
         ),
         "hf": os.environ.get(
             "SMARS_S1_HF_MODEL", "deepseek-ai/DeepSeek-V3.1"
@@ -166,7 +166,7 @@ GROQ_VISION_MODEL = os.environ.get(
 )
 
 # Default model if client doesn’t specify one
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1")  # example; change as needed
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1:free")  # example; change as needed
 
 
 # ---------------------------------------------------------
