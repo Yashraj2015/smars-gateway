@@ -146,12 +146,12 @@ OPENROUTER_KEYS = [
 ]
 HUGGINGFACE_KEYS = [
     k.strip()
-    for k in os.environ.get("HUGGINGFACE_KEYS", "").split(",")
+    for k in os.environ.get("P2KEY", "").split(",")
     if k.strip()
 ]
 
 # HuggingFace base (for OpenAI-compatible /v1/chat/completions)
-HF_API_BASE = os.environ.get("HFKEYS", "https://router.huggingface.co")
+HF_API_BASE = os.environ.get("HUGGINGFACE_API_BASE", "https://router.huggingface.co")
 
 # Web search config (Serper-style by default)
 ENABLE_WEB_SEARCH = os.environ.get("ENABLE_WEB_SEARCH", "false").lower() == "true"
@@ -159,7 +159,7 @@ SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
 SERPER_ENDPOINT = os.environ.get("SERPER_ENDPOINT", "https://google.serper.dev/search")
 
 # Groq vision config
-GROQ_API_KEY = os.environ.get("GQKEY")
+GROQ_API_KEY = os.environ.get("P2KEY")
 GROQ_API_BASE = os.environ.get("GROQ_API_BASE", "https://api.groq.com/openai/v1")
 GROQ_VISION_MODEL = os.environ.get(
     "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
