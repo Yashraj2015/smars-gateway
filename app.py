@@ -42,7 +42,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
     # Your existing DeepSeek V3.1 mapping
     "smars/smars-1": {
         "openrouter": os.environ.get(
-            "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free"
+            "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1"
         ),
         "hf": os.environ.get(
             "SMARS_S1_HF_MODEL", "deepseek-ai/DeepSeek-V3.1"
@@ -146,7 +146,7 @@ OPENROUTER_KEYS = [
 ]
 HUGGINGFACE_KEYS = [
     k.strip()
-    for k in os.environ.get("P2KEY", "").split(",")
+    for k in os.environ.get("HUGGINGFACE_KEYS", "").split(",")
     if k.strip()
 ]
 
@@ -159,14 +159,14 @@ SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
 SERPER_ENDPOINT = os.environ.get("SERPER_ENDPOINT", "https://google.serper.dev/search")
 
 # Groq vision config
-GROQ_API_KEY = os.environ.get("P2KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_API_BASE = os.environ.get("GROQ_API_BASE", "https://api.groq.com/openai/v1")
 GROQ_VISION_MODEL = os.environ.get(
     "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 )
 
 # Default model if client doesn’t specify one
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1:free")  # example; change as needed
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1")  # example; change as needed
 
 
 # ---------------------------------------------------------
