@@ -452,20 +452,73 @@ def _filter_client_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
             filtered.append(m)
     return filtered
 
+def _adapt_payload_for_hf(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adapts OpenRouter-style payload for Hugging Face.
+    1. Removes 'reasoning' param (HF doesn't support it natively).
+    2. If reasoning.enabled=True, injects prompt instructions to force thinking.
+    """
+    # Deep copy to avoid modifying original payload
+    hf_payload = json.loads(json.dumps(payload))
+    
+    # Extract and remove the OpenRouter-specific 'reasoning' block
+    reasoning_config = hf_payload.pop("reasoning", None)
+    
+    force_reasoning = False
+    if reasoning_config and isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is True:
+            force_reasoning = True
+
+    # If user wants forced reasoning, we manually prompt-engineer it for HF
+    if force_reasoning:
+        # Set a slightly stricter temperature for reasoning stability (if not set)
+        if "temperature" not in hf_payload:
+            hf_payload["temperature"] = 0.6
+
+        # Inject instructions into the last user message
+        messages = hf_payload.get("messages", [])
+        if messages:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    user_content = messages[i].get("content")
+                    
+                    # DeepSeek native format uses <think> tags
+                    prompt_instruction = (
+                        "First, provide your step-by-step thinking process inside <reasoning> and </reasoning> tags. "
+                        "Then, after the tags, provide the final answer, explaining how you did it."
+                    )
+
+
+                    # Handle String Content
+                    if isinstance(user_content, str):
+                        messages[i]["content"] = f"{prompt_instruction}\n\n{user_content}"
+                        break
+                    
+                    # Handle List Content (Multimodal)
+                    elif isinstance(user_content, list):
+                        text_found = False
+                        for part in user_content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                part["text"] = f"{prompt_instruction}\n\n{part.get('text', '')}"
+                                text_found = True
+                                break
+                        if not text_found:
+                            user_content.insert(0, {"type": "text", "text": prompt_instruction})
+                        break
+    
+    return hf_payload
+
 def _call_upstream_stream(
     payload: Dict[str, Any],
     backend_model_openrouter: Optional[str],
     backend_model_hf: Optional[str],
 ) -> Optional[requests.Response]:
-    """
-    Open a streaming connection to upstream with failover.
-    Returns a `requests.Response` with stream=True, or None if all providers fail.
-    Caller is responsible for closing the response.
-    """
-    # Try OpenRouter first
+    
+    # ... [OpenRouter Logic remains exactly the same] ...
+    # 1. Try OpenRouter (Max 5 keys)
     if OPENROUTER_KEYS and backend_model_openrouter:
         url = "https://openrouter.ai/api/v1/chat/completions"
-        for idx, key in enumerate(OPENROUTER_KEYS):
+        for idx, key in enumerate(OPENROUTER_KEYS[:5]):
             try:
                 headers = {
                     "Authorization": f"Bearer {key}",
@@ -478,39 +531,35 @@ def _call_upstream_stream(
                 if resp.status_code == 200:
                     return resp
                 else:
-                    logger.warning(
-                        "Primary provider (stream) key #%d returned status %s",
-                        idx + 1,
-                        resp.status_code,
-                    )
+                    logger.warning("OpenRouter (stream) key #%d failed: %s", idx + 1, resp.status_code)
                     resp.close()
             except Exception as e:
-                logger.error("Primary provider (stream) key #%d error: %s", idx + 1, e)
+                logger.error("OpenRouter (stream) key #%d error: %s", idx + 1, e)
 
-    # Fallback to HuggingFace
+    # 2. Fallback to HuggingFace (Max 5 keys)
     if HUGGINGFACE_KEYS and backend_model_hf:
         url = f"{HF_API_BASE.rstrip('/')}/v1/chat/completions"
-        for idx, key in enumerate(HUGGINGFACE_KEYS):
+        
+        # --- CHANGE HERE: Use the new Adapter ---
+        hf_payload = _adapt_payload_for_hf(payload)
+        hf_payload["model"] = backend_model_hf
+        # ----------------------------------------
+
+        for idx, key in enumerate(HUGGINGFACE_KEYS[:5]):
             try:
                 headers = {
                     "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
                 }
-                body = dict(payload)
-                body["model"] = backend_model_hf
 
-                resp = requests.post(url, headers=headers, json=body, stream=True, timeout=60)
+                resp = requests.post(url, headers=headers, json=hf_payload, stream=True, timeout=60)
                 if resp.status_code == 200:
                     return resp
                 else:
-                    logger.warning(
-                        "Backup provider (stream) key #%d returned status %s",
-                        idx + 1,
-                        resp.status_code,
-                    )
+                    logger.warning("HuggingFace (stream) key #%d failed: %s", idx + 1, resp.status_code)
                     resp.close()
             except Exception as e:
-                logger.error("Backup provider (stream) key #%d error: %s", idx + 1, e)
+                logger.error("HuggingFace (stream) key #%d error: %s", idx + 1, e)
 
     return None
 
@@ -557,37 +606,33 @@ def _call_upstream_huggingface(
     payload: Dict[str, Any],
     backend_model_hf: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """
-    Try HuggingFace router with multiple keys in sequence. Returns JSON response or None.
-    """
+    
     if not HUGGINGFACE_KEYS:
         return None
     if not backend_model_hf:
         return None
 
     url = f"{HF_API_BASE.rstrip('/')}/v1/chat/completions"
-    for idx, key in enumerate(HUGGINGFACE_KEYS):
+    
+    # --- CHANGE HERE: Use the new Adapter ---
+    hf_payload = _adapt_payload_for_hf(payload)
+    hf_payload["model"] = backend_model_hf
+    # ----------------------------------------
+
+    for idx, key in enumerate(HUGGINGFACE_KEYS[:5]):
         try:
             headers = {
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
             }
-            body = dict(payload)
-            # Drop OpenRouter-specific reasoning param for HF
-            body.pop("reasoning", None)
-            body["model"] = backend_model_hf
-
-            resp = requests.post(url, headers=headers, json=body, timeout=60)
+            
+            resp = requests.post(url, headers=headers, json=hf_payload, timeout=60)
             if resp.status_code == 200:
                 return resp.json()
             else:
-                logger.warning(
-                    "Backup provider key #%d returned status %s",
-                    idx + 1,
-                    resp.status_code,
-                )
+                logger.warning("HuggingFace (non-stream) key #%d returned status %s", idx + 1, resp.status_code)
         except Exception as e:
-            logger.error("Backup provider key #%d error: %s", idx + 1, e)
+            logger.error("HuggingFace (non-stream) key #%d error: %s", idx + 1, e)
     return None
 
 
