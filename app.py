@@ -865,13 +865,18 @@ def chat_completions():
                     if not raw_line:
                         continue
 
-                    if raw_line.startswith(":"):
+                    try:
+                        line_str = raw_line.decode("utf-8", errors="replace")
+                    except Exception:
                         continue
 
-                    if not raw_line.startswith("data: "):
+                    if line_str.startswith(":"):
                         continue
 
-                    data_str = raw_line[len("data: ") :]
+                    if not line_str.startswith("data: "):
+                        continue
+
+                    data_str = line_str[len("data: ") :]
 
                     if data_str.strip() == "[DONE]":
                         # FIX 3: Explicitly encode to bytes
@@ -906,7 +911,10 @@ def chat_completions():
         return Response(
             generate(), 
             mimetype="text/event-stream; charset=utf-8",
-            headers={"Content-Type": "text/event-stream; charset=utf-8"}
+            headers={
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "X-Accel-Buffering": "no"
+            }
         )
 
     # ---- NON-STREAM BRANCH (existing behaviour) ----
