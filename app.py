@@ -899,7 +899,7 @@ def chat_completions():
                         first_chunk = False
 
                     out = json.dumps(event, ensure_ascii=False)
-                    yield f"data: {out}\n\n"
+                    yield f"data: {out}\n\n".encode("utf-8")
             finally:
                 upstream_stream_resp.close()
 
