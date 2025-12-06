@@ -88,6 +88,8 @@ if SENTRY_DSN:
 
 app = Flask(__name__)
 
+app.json.ensure_ascii = False
+
 # Internal auth keys (comma-separated values)
 SMARS_FREE_KEYS = [
     k.strip()
@@ -872,13 +874,15 @@ def chat_completions():
                     data_str = raw_line[len("data: ") :]
 
                     if data_str.strip() == "[DONE]":
-                        yield "data: [DONE]\n\n"
+                        # FIX 3: Explicitly encode to bytes
+                        yield b"data: [DONE]\n\n"
                         break
 
                     try:
                         event = json.loads(data_str)
                     except Exception:
-                        yield f"data: {data_str}\n\n"
+                        # FIX 3: Explicitly encode to bytes
+                        yield f"data: {data_str}\n\n".encode("utf-8")
                         continue
 
                     # Obfuscate provider & public model in the chunk
@@ -899,7 +903,11 @@ def chat_completions():
             finally:
                 upstream_stream_resp.close()
 
-        return Response(generate(), mimetype="text/event-stream")
+        return Response(
+            generate(), 
+            mimetype="text/event-stream; charset=utf-8",
+            headers={"Content-Type": "text/event-stream; charset=utf-8"}
+        )
 
     # ---- NON-STREAM BRANCH (existing behaviour) ----
     upstream_response = _call_upstream(
