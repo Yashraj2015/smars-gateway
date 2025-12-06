@@ -861,7 +861,7 @@ def chat_completions():
         def generate():
             first_chunk = True
             try:
-                for raw_line in upstream_stream_resp.iter_lines(decode_unicode=True):
+                for raw_line in upstream_stream_resp.iter_lines():
                     if not raw_line:
                         continue
 
