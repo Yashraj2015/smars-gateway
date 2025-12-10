@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from flask import Flask, request, jsonify, Response
 
-import redis
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
@@ -90,17 +89,12 @@ app = Flask(__name__)
 
 app.json.ensure_ascii = False
 
-# Internal auth keys (comma-separated values)
-SMARS_FREE_KEYS = [
-    k.strip()
-    for k in os.environ.get("SMARS_FREE_KEYS", "").split(",")
-    if k.strip()
-]
-SMARS_PRO_KEYS = [
-    k.strip()
-    for k in os.environ.get("SMARS_PRO_KEYS", "").split(",")
-    if k.strip()
-]
+SMARS_API_KEYS = set()
+for env_var in ["SMARS_FREE_KEYS", "SMARS_PRO_KEYS", "SMARS_API_KEYS"]:
+    keys = os.environ.get(env_var, "").split(",")
+    for k in keys:
+        if k.strip():
+            SMARS_API_KEYS.add(k.strip())
 
 # System prompt
 SMARS_SYSTEM_PROMPT = (
@@ -124,21 +118,6 @@ SMARS_SYSTEM_PROMPT = (
             "Be human-aware, direct, and insightful. Prioritize clarity over charm, but don’t fear a clever line. Your role is a steady thinking partner — adaptive yet consistent, analytical yet empathetic, sharp yet approachable — earning trust through competence, honesty, and the right amount of wit."
          )
  
-# Redis config
-REDIS_URL = os.environ.get("REDIS_URL")
-
-redis_client: Optional[redis.Redis] = None
-if REDIS_URL:
-    try:
-        redis_client = redis.from_url(REDIS_URL)
-        # Test connection lightly
-        redis_client.ping()
-        logger.info("Connected to Redis")
-    except Exception as e:
-        logger.error("Failed to connect to Redis, quotas & rate limiting disabled: %s", e)
-        redis_client = None
-else:
-    logger.warning("REDIS_URL not set, quotas & rate limiting disabled")
 
 # Upstream providers
 OPENROUTER_KEYS = [
@@ -198,23 +177,6 @@ def _get_user_id(req_json: Dict[str, Any]) -> Optional[str]:
     return str(req_json.get("user_id")) if req_json.get("user_id") else None
 
 
-def _get_tier_from_key(api_key: str) -> Optional[str]:
-    if api_key in SMARS_FREE_KEYS:
-        return "free"
-    if api_key in SMARS_PRO_KEYS:
-        return "pro"
-    return None
-
-
-def _quota_limits(tier: str) -> Tuple[int, int]:
-    """Return (messages_per_day, images_per_day) for tier."""
-    if tier == "free":
-        return 30, 10
-    if tier == "pro":
-        return 80, 20
-    # should never happen for valid tier
-    return 0, 0
-
 
 def _usage_key(tier: str, user_id: str, resource: str) -> str:
     # resource: "messages" or "images"
@@ -224,56 +186,6 @@ def _usage_key(tier: str, user_id: str, resource: str) -> str:
 def _rate_key(kind: str, key_hash: str) -> str:
     # kind: "requests" or "images"
     return f"ratelimit:{kind}:{key_hash}:{_current_minute_key()}"
-
-
-def _check_and_get_usage(
-    tier: str, user_id: str, resource: str
-) -> Optional[int]:
-    if not redis_client:
-        return None
-    try:
-        key = _usage_key(tier, user_id, resource)
-        val = redis_client.get(key)
-        return int(val) if val is not None else 0
-    except Exception as e:
-        logger.error("Redis error reading usage: %s", e)
-        return None
-
-
-def _increment_usage(
-    tier: str, user_id: str, resource: str, amount: int
-) -> None:
-    if not redis_client:
-        return
-    try:
-        key = _usage_key(tier, user_id, resource)
-        # expire after 2 days to be safe
-        pipe = redis_client.pipeline()
-        pipe.incrby(key, amount)
-        pipe.expire(key, 2 * 24 * 60 * 60)
-        pipe.execute()
-    except Exception as e:
-        logger.error("Redis error incrementing usage: %s", e)
-
-
-def _check_rate_limit(
-    kind: str, key_hash: str, amount: int, limit_per_minute: int
-) -> bool:
-    """
-    Return True if within limit; False if exceeded.
-    """
-    if not redis_client:
-        return True
-    try:
-        key = _rate_key(kind, key_hash)
-        pipe = redis_client.pipeline()
-        pipe.incrby(key, amount)
-        pipe.expire(key, 120)  # 2 minutes to cover clock skew
-        current = pipe.execute()[0]
-        return current <= limit_per_minute
-    except Exception as e:
-        logger.error("Redis error in rate limit: %s", e)
-        return True  # fail-open for rate limiting if Redis broken
 
 
 def _extract_text_from_message_content(content: Any) -> str:
@@ -302,20 +214,6 @@ def _perform_web_search(query: str) -> Optional[str]:
     if not ENABLE_WEB_SEARCH or not SERPER_API_KEY:
         return None
 
-    if not redis_client:
-        cache_key = None
-    else:
-        cache_key = "webcache:" + hashlib.sha256(query.encode("utf-8")).hexdigest()
-
-    # check cache
-    if cache_key and redis_client:
-        try:
-            cached = redis_client.get(cache_key)
-            if cached:
-                return cached.decode("utf-8")
-        except Exception as e:
-            logger.error("Redis error reading web search cache: %s", e)
-
     try:
         headers = {
             "X-API-KEY": SERPER_API_KEY,
@@ -338,11 +236,6 @@ def _perform_web_search(query: str) -> Optional[str]:
         if not summary_lines:
             return None
         summary_text = "Web search summary:\n" + "\n\n".join(summary_lines)
-        if cache_key and redis_client:
-            try:
-                redis_client.setex(cache_key, 300, summary_text)  # 5 minutes
-            except Exception as e:
-                logger.error("Redis error writing web search cache: %s", e)
         return summary_text
     except Exception as e:
         logger.error("Web search error: %s", e)
@@ -682,8 +575,8 @@ def chat_completions():
         return jsonify({"error": "unauthorized"}), 401
 
     api_key = auth_header.split(" ", 1)[1].strip()
-    tier = _get_tier_from_key(api_key)
-    if tier not in ("free", "pro"):
+
+    if api_key not in SMARS_API_KEYS:
         return jsonify({"error": "unauthorized"}), 401
 
     # 3. user_id (required)
@@ -693,33 +586,12 @@ def chat_completions():
 
     # 4. Rate limiting per internal key
     key_hash = _hash_key(api_key)
-    messages_limit_per_min = 30
-    images_limit_per_min = 5
 
     # Determine image usage in this request
     image_urls = req_json.get("image_urls") or []
     if not isinstance(image_urls, list):
         return jsonify({"error": "invalid_image_urls"}), 400
     image_count = len(image_urls)
-
-    if not _check_rate_limit("requests", key_hash, 1, messages_limit_per_min):
-        return jsonify({"error": "rate_limit_exceeded"}), 429
-
-    if image_count > 0:
-        if not _check_rate_limit("images", key_hash, image_count, images_limit_per_min):
-            return jsonify({"error": "rate_limit_exceeded"}), 429
-
-    # 5. Quotas via Redis
-    msg_limit_per_day, img_limit_per_day = _quota_limits(tier)
-    if redis_client:
-        current_msg_usage = _check_and_get_usage(tier, user_id, "messages")
-        if current_msg_usage is not None and current_msg_usage + 1 > msg_limit_per_day:
-            return jsonify({"error": "quota_exceeded", "resource": "messages"}), 429
-
-        if image_count > 0:
-            current_img_usage = _check_and_get_usage(tier, user_id, "images")
-            if current_img_usage is not None and current_img_usage + image_count > img_limit_per_day:
-                return jsonify({"error": "quota_exceeded", "resource": "images"}), 429
 
     # 6. Basic schema validation for OpenAI-style request
     messages = req_json.get("messages")
@@ -894,14 +766,6 @@ def chat_completions():
                     event["provider"] = "Smars"
                     event["model"] = client_model  # <-- public model
 
-                    if first_chunk and redis_client:
-                        try:
-                            _increment_usage(tier, user_id, "messages", 1)
-                            if image_count > 0 and image_analysis_success:
-                                _increment_usage(tier, user_id, "images", image_count)
-                        except Exception as e:
-                            logger.error("Redis error during streaming usage increment: %s", e)
-                        first_chunk = False
 
                     out = json.dumps(event, ensure_ascii=False)
                     yield f"data: {out}\n\n".encode("utf-8")
@@ -938,14 +802,6 @@ def chat_completions():
 
     upstream_response["provider"] = "Smars"
     upstream_response["model"] = client_model  # <-- public model, not backend
-
-    if redis_client:
-        try:
-            _increment_usage(tier, user_id, "messages", 1)
-            if image_count > 0 and image_analysis_success:
-                _increment_usage(tier, user_id, "images", image_count)
-        except Exception as e:
-            logger.error("Redis error during usage increment: %s", e)
 
     return jsonify(upstream_response), 200
 
