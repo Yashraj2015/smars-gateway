@@ -625,7 +625,7 @@ def chat_completions():
                         }
                     )
 
-    # 8. Image analysis pipeline via Groq
+    # 8. Image analysis pipeline via groq
     image_analysis_success = False
     if image_count > 0:
         if not GROQ_API_KEY:
