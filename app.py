@@ -41,10 +41,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
     # Your existing DeepSeek V3.1 mapping
     "smars/smars-1": {
         "openrouter": os.environ.get(
-            "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1"
+            "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-v3.2"
         ),
         "hf": os.environ.get(
-            "SMARS_S1_HF_MODEL", "deepseek-ai/DeepSeek-V3.1"
+            "SMARS_S1_HF_MODEL", "deepseek-ai/DeepSeek-V3.2"
         ),
     },
 
