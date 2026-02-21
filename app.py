@@ -735,9 +735,25 @@ def chat_completions():
             )
 
         def generate():
+            # `iter_lines` can block for a long time if the upstream provider
+            # stalls; gunicorn has a default 30‑second worker timeout which
+            # will abort the request and raise SystemExit (as seen in the log).
+            #
+            # Two improvements:
+            # 1. Catch any `requests` exceptions so we can log and exit cleanly
+            # 2. Periodically send a comment line (SSE keep‑alive) so the
+            #    worker doesn’t sit idle for too long.
+            import time
             first_chunk = True
+            last_yield = time.time()
             try:
                 for raw_line in upstream_stream_resp.iter_lines():
+                    # send a noop comment every 20s to keep gunicorn happy
+                    now = time.time()
+                    if now - last_yield > 20:
+                        yield b": keepalive\n\n"
+                        last_yield = now
+
                     if not raw_line:
                         continue
 
@@ -773,6 +789,13 @@ def chat_completions():
 
                     out = json.dumps(event, ensure_ascii=False)
                     yield f"data: {out}\n\n".encode("utf-8")
+            except requests.exceptions.RequestException as exc:
+                logger.error("upstream stream error: %s", exc)
+                # let the client know something went wrong
+                try:
+                    yield b"data: {\"error\":\"upstream_stream_failure\"}\n\n"
+                except Exception:
+                    pass
             finally:
                 upstream_stream_resp.close()
 
