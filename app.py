@@ -361,6 +361,63 @@ def _filter_client_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
             filtered.append(m)
     return filtered
 
+
+def _extract_image_url_from_content_part(part: Any) -> Optional[str]:
+    """
+    Parse image URL from common OpenAI-style multimodal content parts.
+    Supports:
+    - {"type":"image_url","image_url":{"url":"..."}}
+    - {"type":"image_url","image_url":"..."}
+    - {"type":"input_image","image_url":"..."}
+    - {"type":"input_image","image_url":{"url":"..."}}
+    """
+    if not isinstance(part, dict):
+        return None
+
+    part_type = part.get("type")
+    if part_type not in ("image_url", "input_image", "image"):
+        return None
+
+    raw_image_url = part.get("image_url")
+    if raw_image_url is None:
+        raw_image_url = part.get("url")
+
+    if isinstance(raw_image_url, str):
+        return raw_image_url
+    if isinstance(raw_image_url, dict):
+        nested_url = raw_image_url.get("url")
+        if isinstance(nested_url, str):
+            return nested_url
+    return None
+
+
+def _extract_inline_image_urls(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Extract image URLs from message content blocks and return sanitized messages
+    that keep only non-image parts.
+    """
+    sanitized_messages = copy.deepcopy(messages)
+    image_urls: List[str] = []
+
+    for message in sanitized_messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        kept_parts: List[Any] = []
+        for part in content:
+            image_url = _extract_image_url_from_content_part(part)
+            if image_url is not None:
+                image_urls.append(image_url)
+                continue
+            kept_parts.append(part)
+
+        message["content"] = kept_parts if kept_parts else ""
+
+    return sanitized_messages, image_urls
+
 def _adapt_payload_for_hf(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Adapts OpenRouter-style payload for Hugging Face.
@@ -601,11 +658,10 @@ def chat_completions():
     # 4. Rate limiting per internal key
     key_hash = _hash_key(api_key)
 
-    # Determine image usage in this request
-    image_urls = req_json.get("image_urls") or []
-    if not isinstance(image_urls, list):
+    # Determine image usage in this request (legacy top-level field)
+    image_urls_from_body = req_json.get("image_urls") or []
+    if not isinstance(image_urls_from_body, list):
         return jsonify({"error": "invalid_image_urls"}), 400
-    image_count = len(image_urls)
 
     # 6. Basic schema validation for OpenAI-style request
     messages = req_json.get("messages")
@@ -617,6 +673,12 @@ def chat_completions():
 
     if not filtered_messages:
         return jsonify({"error": "invalid_request", "message": "no user/assistant messages after filtering"}), 400
+
+    # Extract inline image blocks and keep a text-only message payload for upstream models.
+    filtered_messages, image_urls_from_messages = _extract_inline_image_urls(filtered_messages)
+    image_urls: List[Any] = list(image_urls_from_body)
+    image_urls.extend(image_urls_from_messages)
+    image_count = len(image_urls)
 
     # 7. Web search (optional, based on latest user message)
     web_search_flag = bool(req_json.get("web_search")) and ENABLE_WEB_SEARCH
