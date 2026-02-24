@@ -312,6 +312,54 @@ IDENTITY_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+ARTIFACT_TOKEN_REGEX = re.compile(
+    r"<\s*[|\uFF5C]\s*"
+    r"(?:begin[_\s]*of[_\s]*sentence|end[_\s]*of[_\s]*sentence|fim[_\s]*(?:begin|hole|middle|end)|"
+    r"eot[_\s]*id|start[_\s]*header[_\s]*id|end[_\s]*header[_\s]*id|reserved[_\s]*special[_\s]*token|"
+    r"DSML|tool(?:\s|_)*(?:calls?|call|sep)(?:\s|_)*(?:begin|end)?)"
+    r"\s*[|\uFF5C]\s*>",
+    re.IGNORECASE,
+)
+
+PLAIN_ARTIFACT_REGEX = re.compile(
+    r"\b(?:begin[_\s]*of[_\s]*sentence|fim[_\s]*(?:begin|hole|middle|end)|eot[_\s]*id)\b",
+    re.IGNORECASE,
+)
+
+def _strip_generation_artifacts(text: Any) -> Any:
+    if not isinstance(text, str):
+        return text
+    cleaned = ARTIFACT_TOKEN_REGEX.sub("", text)
+    cleaned = PLAIN_ARTIFACT_REGEX.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n\s*\n\s*\n+", "\n\n", cleaned)
+    return cleaned
+
+def _sanitize_response_payload(response_json: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Defensive cleanup for known control-token artifacts in both streaming and non-stream payloads.
+    """
+    choices = response_json.get("choices")
+    if not isinstance(choices, list):
+        return response_json
+
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            if "content" in delta:
+                delta["content"] = _strip_generation_artifacts(delta.get("content"))
+            if "reasoning" in delta:
+                delta["reasoning"] = _strip_generation_artifacts(delta.get("reasoning"))
+
+        msg = choice.get("message")
+        if isinstance(msg, dict) and "content" in msg:
+            msg["content"] = _strip_generation_artifacts(msg.get("content"))
+
+    return response_json
+
 
 def _enforce_identity(response_json: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -342,13 +390,13 @@ def _build_system_message() -> Dict[str, Any]:
 
 def _filter_client_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Drop system messages coming from client. Keep only user & assistant,
-    as requested.
+    Keep all message roles required for tool-calling continuity.
+    NOTE: Dropping `tool` messages breaks post-tool follow-up turns.
     """
     filtered: List[Dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
-        if role in ("user", "assistant"):
+        if role in ("system", "user", "assistant", "tool"):
             filtered.append(m)
     return filtered
 
@@ -608,6 +656,8 @@ def chat_completions():
 
     if not filtered_messages:
         return jsonify({"error": "invalid_request", "message": "no user/assistant messages after filtering"}), 400
+    if not any((m.get("role") == "user") for m in filtered_messages):
+        return jsonify({"error": "invalid_request", "message": "at least one user message is required"}), 400
 
     # 7. Web search (optional, based on latest user message)
     web_search_flag = bool(req_json.get("web_search")) and ENABLE_WEB_SEARCH
@@ -763,11 +813,13 @@ def chat_completions():
                     try:
                         event = json.loads(data_str)
                     except Exception:
+                        data_str = _strip_generation_artifacts(data_str)
                         # FIX 3: Explicitly encode to bytes
                         yield f"data: {data_str}\n\n".encode("utf-8")
                         continue
 
                     # Obfuscate provider & public model in the chunk
+                    event = _sanitize_response_payload(event)
                     event["provider"] = "Smars"
                     event["model"] = client_model  # <-- public model
 
@@ -803,6 +855,7 @@ def chat_completions():
             503,
         )
 
+    upstream_response = _sanitize_response_payload(upstream_response)
     upstream_response = _enforce_identity(upstream_response)
 
     upstream_response["provider"] = "Smars"
