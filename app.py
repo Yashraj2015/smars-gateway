@@ -211,6 +211,105 @@ def _extract_text_from_message_content(content: Any) -> str:
     return ""
 
 
+def _normalize_image_url_candidate(raw_url: Any) -> Optional[str]:
+    """Normalize and validate image URL candidates from request payload."""
+    if not isinstance(raw_url, str):
+        return None
+    value = raw_url.strip()
+    if not value:
+        return None
+    if value.startswith("data:image/"):
+        return value
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    return None
+
+
+def _extract_image_urls_from_message_content(content: Any) -> List[str]:
+    """Extract image URLs from OpenAI-style content blocks."""
+    urls: List[str] = []
+    if not isinstance(content, list):
+        return urls
+
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "").lower()
+        if part_type not in ("image_url", "input_image", "image"):
+            continue
+
+        candidate = None
+        image_url_obj = part.get("image_url")
+        if isinstance(image_url_obj, dict):
+            candidate = image_url_obj.get("url") or image_url_obj.get("image_url")
+        elif isinstance(image_url_obj, str):
+            candidate = image_url_obj
+        elif isinstance(part.get("url"), str):
+            candidate = part.get("url")
+
+        normalized = _normalize_image_url_candidate(candidate)
+        if normalized:
+            urls.append(normalized)
+
+    return urls
+
+
+def _extract_image_urls_from_messages(messages: List[Dict[str, Any]]) -> List[str]:
+    """Extract all image URLs from message content blocks across the conversation."""
+    urls: List[str] = []
+    for msg in messages:
+        urls.extend(_extract_image_urls_from_message_content(msg.get("content")))
+    return urls
+
+
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _strip_images_from_message_content(content: Any) -> Any:
+    """
+    Remove image blocks from message content before forwarding to text models.
+    If a message had only images, keep a short text stub so intent isn't lost.
+    """
+    if not isinstance(content, list):
+        return content
+
+    cleaned: List[Any] = []
+    removed_images = 0
+    for part in content:
+        if isinstance(part, dict):
+            part_type = str(part.get("type") or "").lower()
+            if part_type in ("image_url", "input_image", "image"):
+                removed_images += 1
+                continue
+        cleaned.append(part)
+
+    if removed_images == 0:
+        return content
+    if cleaned:
+        return cleaned
+    return [{"type": "text", "text": "[User attached image(s). Refer to image analysis context.]"}]
+
+
+def _strip_images_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a copy of messages where image blocks are removed from content arrays."""
+    cleaned_messages: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        copied = dict(msg)
+        copied["content"] = _strip_images_from_message_content(msg.get("content"))
+        cleaned_messages.append(copied)
+    return cleaned_messages
+
+
 def _perform_web_search(query: str) -> Optional[str]:
     """
     Perform a simple web search and return a textual summary.
@@ -641,10 +740,9 @@ def chat_completions():
     key_hash = _hash_key(api_key)
 
     # Determine image usage in this request
-    image_urls = req_json.get("image_urls") or []
-    if not isinstance(image_urls, list):
+    top_level_image_urls = req_json.get("image_urls") or []
+    if not isinstance(top_level_image_urls, list):
         return jsonify({"error": "invalid_image_urls"}), 400
-    image_count = len(image_urls)
 
     # 6. Basic schema validation for OpenAI-style request
     messages = req_json.get("messages")
@@ -658,6 +756,18 @@ def chat_completions():
         return jsonify({"error": "invalid_request", "message": "no user/assistant messages after filtering"}), 400
     if not any((m.get("role") == "user") for m in filtered_messages):
         return jsonify({"error": "invalid_request", "message": "at least one user message is required"}), 400
+
+    # Extract images both from top-level `image_urls` and from message content blocks.
+    normalized_top_level = [
+        _normalize_image_url_candidate(url) for url in top_level_image_urls
+    ]
+    normalized_top_level = [u for u in normalized_top_level if u]
+    message_image_urls = _extract_image_urls_from_messages(filtered_messages)
+    image_urls = _dedupe_preserve_order(normalized_top_level + message_image_urls)
+    image_count = len(image_urls)
+
+    # Forward text-only content upstream; image understanding is injected via Groq context below.
+    filtered_messages = _strip_images_from_messages(filtered_messages)
 
     # 7. Web search (optional, based on latest user message)
     web_search_flag = bool(req_json.get("web_search")) and ENABLE_WEB_SEARCH
@@ -695,9 +805,6 @@ def chat_completions():
             all_texts: List[str] = []
             any_failure = False
             for idx, url in enumerate(image_urls):
-                if not isinstance(url, str):
-                    any_failure = True
-                    continue
                 desc = _analyze_image_with_groq(url)
                 if desc is None:
                     any_failure = True
@@ -708,6 +815,15 @@ def chat_completions():
                     {
                         "role": "assistant",
                         "content": "Image analysis context:\n\n" + "\n\n".join(all_texts),
+                    }
+                )
+            if not all_texts:
+                filtered_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Image analysis context was requested but extraction failed for all images."
+                        ),
                     }
                 )
             if any_failure:
