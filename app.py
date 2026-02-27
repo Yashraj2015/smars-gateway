@@ -310,6 +310,50 @@ def _strip_images_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str
     return cleaned_messages
 
 
+def _inject_context_into_last_user_message(
+    messages: List[Dict[str, Any]],
+    context_text: str,
+) -> List[Dict[str, Any]]:
+    """
+    Inject auxiliary context (web/image) into the latest user turn.
+    This keeps the final turn as `user` and avoids odd continuation behavior.
+    """
+    context_text = (context_text or "").strip()
+    if not context_text:
+        return messages
+
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = f"{context_text}\n\n{content}" if content else context_text
+            return messages
+
+        if isinstance(content, list):
+            injected = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in ("text", "input_text"):
+                    existing = str(part.get("text") or "")
+                    part["text"] = f"{context_text}\n\n{existing}" if existing else context_text
+                    injected = True
+                    break
+            if not injected:
+                content.insert(0, {"type": "text", "text": context_text})
+            msg["content"] = content
+            return messages
+
+        msg["content"] = context_text
+        return messages
+
+    messages.append({"role": "user", "content": context_text})
+    return messages
+
+
 def _perform_web_search(query: str) -> Optional[str]:
     """
     Perform a simple web search and return a textual summary.
@@ -421,14 +465,20 @@ ARTIFACT_TOKEN_REGEX = re.compile(
 )
 
 PLAIN_ARTIFACT_REGEX = re.compile(
-    r"\b(?:begin[_\s]*of[_\s]*sentence|fim[_\s]*(?:begin|hole|middle|end)|eot[_\s]*id)\b",
+    r"\b(?:begin[_\s\u2581-]*of[_\s\u2581-]*sentence|fim[_\s]*(?:begin|hole|middle|end)|eot[_\s]*id)\b",
+    re.IGNORECASE,
+)
+
+BROKEN_SENTENCE_TOKEN_REGEX = re.compile(
+    r"<\s*[|\uFF5C]\s*begin[_\s\u2581-]*of[_\s\u2581-]*sentence\s*[|\uFF5C]\s*>",
     re.IGNORECASE,
 )
 
 def _strip_generation_artifacts(text: Any) -> Any:
     if not isinstance(text, str):
         return text
-    cleaned = ARTIFACT_TOKEN_REGEX.sub("", text)
+    cleaned = BROKEN_SENTENCE_TOKEN_REGEX.sub("", text)
+    cleaned = ARTIFACT_TOKEN_REGEX.sub("", cleaned)
     cleaned = PLAIN_ARTIFACT_REGEX.sub("", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n\s*\n\s*\n+", "\n\n", cleaned)
@@ -765,6 +815,7 @@ def chat_completions():
     message_image_urls = _extract_image_urls_from_messages(filtered_messages)
     image_urls = _dedupe_preserve_order(normalized_top_level + message_image_urls)
     image_count = len(image_urls)
+    logger.info("Image pipeline: extracted %d image(s) for request", image_count)
 
     # Forward text-only content upstream; image understanding is injected via Groq context below.
     filtered_messages = _strip_images_from_messages(filtered_messages)
@@ -783,23 +834,22 @@ def chat_completions():
             if query_text:
                 summary = _perform_web_search(query_text)
                 if summary:
-                    filtered_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": summary,
-                        }
+                    web_context = (
+                        "Web search context (use this only if relevant and recent):\n\n"
+                        f"{summary}"
+                    )
+                    filtered_messages = _inject_context_into_last_user_message(
+                        filtered_messages,
+                        web_context,
                     )
 
     # 8. Image analysis pipeline via groq
-    image_analysis_success = False
     if image_count > 0:
         if not GROQ_API_KEY:
-            # No vision support available
-            filtered_messages.append(
-                {
-                    "role": "assistant",
-                    "content": "Image extraction failed.",
-                }
+            image_context = "Image analysis failed: vision provider is unavailable."
+            filtered_messages = _inject_context_into_last_user_message(
+                filtered_messages,
+                image_context,
             )
         else:
             all_texts: List[str] = []
@@ -810,32 +860,28 @@ def chat_completions():
                     any_failure = True
                 else:
                     all_texts.append(f"Image {idx+1} analysis:\n{desc}")
+
+            image_context_parts: List[str] = []
             if all_texts:
-                filtered_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "Image analysis context:\n\n" + "\n\n".join(all_texts),
-                    }
+                image_context_parts.append(
+                    "Image analysis context from vision model:\n\n" + "\n\n".join(all_texts)
                 )
-            if not all_texts:
-                filtered_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Image analysis context was requested but extraction failed for all images."
-                        ),
-                    }
+            else:
+                image_context_parts.append(
+                    "Image analysis failed for all provided images."
                 )
             if any_failure:
-                filtered_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "Image extraction failed for one or more images.",
-                    }
-                )
-                image_analysis_success = False
-            else:
-                image_analysis_success = True
+                image_context_parts.append("One or more images could not be analyzed.")
+            logger.info(
+                "Image pipeline: analyzed=%d failed=%d",
+                len(all_texts),
+                max(0, image_count - len(all_texts)),
+            )
+
+            filtered_messages = _inject_context_into_last_user_message(
+                filtered_messages,
+                "\n\n".join(image_context_parts),
+            )
 
     # 9. Build final messages with single system identity prompt
     final_messages: List[Dict[str, Any]] = []
