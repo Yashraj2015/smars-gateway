@@ -624,7 +624,7 @@ def _call_upstream_stream(
                 body = dict(payload)
                 body["model"] = backend_model_openrouter
 
-                resp = requests.post(url, headers=headers, json=body, stream=True, timeout=60)
+                resp = requests.post(url, headers=headers, json=body, stream=True, timeout=(10, 360))
                 if resp.status_code == 200:
                     return resp
                 else:
@@ -649,7 +649,7 @@ def _call_upstream_stream(
                     "Content-Type": "application/json",
                 }
 
-                resp = requests.post(url, headers=headers, json=hf_payload, stream=True, timeout=60)
+                resp = requests.post(url, headers=headers, json=hf_payload, stream=True, timeout=(10, 360))
                 if resp.status_code == 200:
                     return resp
                 else:
@@ -684,7 +684,7 @@ def _call_upstream_openrouter(
             body = dict(payload)
             body["model"] = backend_model_openrouter
 
-            resp = requests.post(url, headers=headers, json=body, timeout=60)
+            resp = requests.post(url, headers=headers, json=body, timeout=120)
             if resp.status_code == 200:
                 return resp.json()
             else:
@@ -723,7 +723,7 @@ def _call_upstream_huggingface(
                 "Content-Type": "application/json",
             }
             
-            resp = requests.post(url, headers=headers, json=hf_payload, timeout=60)
+            resp = requests.post(url, headers=headers, json=hf_payload, timeout=120)
             if resp.status_code == 200:
                 return resp.json()
             else:
