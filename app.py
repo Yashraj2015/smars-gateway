@@ -156,6 +156,18 @@ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1")  
 MAX_AUTO_CONTINUATIONS = max(0, int(os.environ.get("SMARS_MAX_AUTO_CONTINUATIONS", "12")))
 CONTINUATION_BUFFER_CHARS = max(24, int(os.environ.get("SMARS_CONTINUATION_BUFFER_CHARS", "96")))
 CONTINUATION_OVERLAP_WINDOW = max(64, int(os.environ.get("SMARS_CONTINUATION_OVERLAP_WINDOW", "240")))
+UPSTREAM_CONNECT_TIMEOUT_SECONDS = max(
+    3,
+    int(os.environ.get("SMARS_UPSTREAM_CONNECT_TIMEOUT_SECONDS", "10")),
+)
+UPSTREAM_STREAM_READ_TIMEOUT_SECONDS = max(
+    5,
+    int(os.environ.get("SMARS_UPSTREAM_STREAM_READ_TIMEOUT_SECONDS", "20")),
+)
+UPSTREAM_NON_STREAM_TIMEOUT_SECONDS = max(
+    15,
+    int(os.environ.get("SMARS_UPSTREAM_NON_STREAM_TIMEOUT_SECONDS", "120")),
+)
 CONTINUATION_PROMPT = (
     "Continue the same answer immediately from the exact point it stopped. "
     "Start with the very next token only. "
@@ -766,7 +778,7 @@ def _generate_stream_with_auto_continue(
         stream_interrupted = False
 
         try:
-            for raw_line in current_response.iter_lines():
+            for raw_line in current_response.iter_lines(chunk_size=1):
                 if not raw_line:
                     continue
 
@@ -1127,7 +1139,16 @@ def _call_upstream_stream(
                 body = dict(payload)
                 body["model"] = backend_model_openrouter
 
-                resp = requests.post(url, headers=headers, json=body, stream=True, timeout=(10, 360))
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    stream=True,
+                    timeout=(
+                        UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+                        UPSTREAM_STREAM_READ_TIMEOUT_SECONDS,
+                    ),
+                )
                 if resp.status_code == 200:
                     return resp
                 else:
@@ -1152,7 +1173,16 @@ def _call_upstream_stream(
                     "Content-Type": "application/json",
                 }
 
-                resp = requests.post(url, headers=headers, json=hf_payload, stream=True, timeout=(10, 360))
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json=hf_payload,
+                    stream=True,
+                    timeout=(
+                        UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+                        UPSTREAM_STREAM_READ_TIMEOUT_SECONDS,
+                    ),
+                )
                 if resp.status_code == 200:
                     return resp
                 else:
@@ -1187,7 +1217,12 @@ def _call_upstream_openrouter(
             body = dict(payload)
             body["model"] = backend_model_openrouter
 
-            resp = requests.post(url, headers=headers, json=body, timeout=120)
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=UPSTREAM_NON_STREAM_TIMEOUT_SECONDS,
+            )
             if resp.status_code == 200:
                 return resp.json()
             else:
@@ -1226,7 +1261,12 @@ def _call_upstream_huggingface(
                 "Content-Type": "application/json",
             }
             
-            resp = requests.post(url, headers=headers, json=hf_payload, timeout=120)
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=hf_payload,
+                timeout=UPSTREAM_NON_STREAM_TIMEOUT_SECONDS,
+            )
             if resp.status_code == 200:
                 return resp.json()
             else:
