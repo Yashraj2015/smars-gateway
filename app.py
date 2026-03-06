@@ -124,11 +124,7 @@ SMARS_SYSTEM_PROMPT = (
  
 CONVERSATION_TITLE_TASK = "conversation_title"
 CONVERSATION_TITLE_SYSTEM_PROMPT = (
-    "You generate chat session titles from the user's first prompt. "
-    "Return only a short title. "
-    "Do not answer the prompt. "
-    "Do not use quotes, prefixes, markdown, emojis, or explanations. "
-    "Keep it specific and concise, ideally 2 to 6 words."
+    "You only generate chat session titles."
 )
 
  
@@ -1064,6 +1060,25 @@ def _build_system_message(task_type: Optional[str] = None) -> Dict[str, Any]:
     return {"role": "system", "content": content}
 
 
+def _build_title_task_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse a title-generation request into one explicit instruction turn."""
+    latest_user_text = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        latest_user_text = _extract_text_from_message_content(message.get("content")).strip()
+        if latest_user_text:
+            break
+
+    instruction = (
+        "Generate a title for this prompt. "
+        "Do not answer the question. "
+        "Return only the title text.\n\n"
+        f"Prompt: {latest_user_text}"
+    )
+    return [{"role": "user", "content": instruction}]
+
+
 def _filter_client_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Keep all message roles required for tool-calling continuity.
@@ -1380,6 +1395,8 @@ def chat_completions():
 
     # Forward text-only content upstream; image understanding is injected via Groq context below.
     filtered_messages = _strip_images_from_messages(filtered_messages)
+    if task_type == CONVERSATION_TITLE_TASK:
+        filtered_messages = _build_title_task_messages(filtered_messages)
 
     # 7. Web search (optional, based on latest user message)
     web_search_flag = bool(req_json.get("web_search")) and ENABLE_WEB_SEARCH and task_type != CONVERSATION_TITLE_TASK
