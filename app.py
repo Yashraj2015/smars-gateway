@@ -153,6 +153,29 @@ GROQ_VISION_MODEL = os.environ.get(
 
 # Default model if client doesn’t specify one
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1")  # example; change as needed
+MAX_AUTO_CONTINUATIONS = max(0, int(os.environ.get("SMARS_MAX_AUTO_CONTINUATIONS", "12")))
+CONTINUATION_BUFFER_CHARS = max(24, int(os.environ.get("SMARS_CONTINUATION_BUFFER_CHARS", "96")))
+CONTINUATION_OVERLAP_WINDOW = max(64, int(os.environ.get("SMARS_CONTINUATION_OVERLAP_WINDOW", "240")))
+CONTINUATION_PROMPT = (
+    "Continue the same answer immediately from the exact point it stopped. "
+    "Start with the very next token only. "
+    "Do not repeat any prior text. "
+    "Do not add explanations, intros, acknowledgements, or phrases about continuing. "
+    "If the answer is code or markdown, continue the same block and formatting exactly."
+)
+TERMINAL_RESPONSE_ENDINGS = set(".!?)]}\"'")
+TRAILING_CONNECTOR_REGEX = re.compile(
+    r"(?:\b(?:and|or|but|so|because|with|to|for|of|in|on|at|from|via|using|that|which|who|where|when|while|if|then|than|as)\b|[:;,/\-])\s*$",
+    re.IGNORECASE,
+)
+CONTINUATION_META_PREFIX_REGEX = re.compile(
+    r"^\s*(?:(?:sure|okay|ok|alright|certainly|absolutely|here(?:'s| is))[\s,.:!-]*)?"
+    r"(?:(?:i(?:'ll| will)|let me)\s+)?"
+    r"(?:continue|complete|finish|resume|pick up)\b[^:\n]{0,80}[:\-\s]*",
+    re.IGNORECASE,
+)
+BOLD_MARKER_REGEX = re.compile(r"(?<!\*)\*\*(?!\*)|(?<!_)__(?!_)")
+INLINE_CODE_MARKER_REGEX = re.compile(r"(?<!`)`(?!`)")
 
 
 # ---------------------------------------------------------
@@ -508,6 +531,486 @@ def _sanitize_response_payload(response_json: Dict[str, Any]) -> Dict[str, Any]:
             msg["content"] = _strip_generation_artifacts(msg.get("content"))
 
     return response_json
+
+
+def _deep_copy_json(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def _strip_continuation_meta_prefix(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    return CONTINUATION_META_PREFIX_REGEX.sub("", text, count=1)
+
+
+def _has_unbalanced_markdown(text: str) -> bool:
+    if not text:
+        return False
+    if text.count("```") % 2 == 1:
+        return True
+    text_without_fences = text.replace("```", "")
+    if len(BOLD_MARKER_REGEX.findall(text_without_fences)) % 2 == 1:
+        return True
+    if len(INLINE_CODE_MARKER_REGEX.findall(text_without_fences)) % 2 == 1:
+        return True
+    return False
+
+
+def _has_strong_incomplete_signal(text: str) -> bool:
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return False
+
+    last_line = stripped.splitlines()[-1].strip()
+    if _has_unbalanced_markdown(stripped):
+        return True
+    if stripped.endswith(("**", "__", "```", "`", ":", ";", "(", "[", "{", ",", "/", "\\")):
+        return True
+    if re.match(r"^(?:[-*+]|\d+\.)\s*(?:\*\*|__|`{1,3})?$", last_line):
+        return True
+    if TRAILING_CONNECTOR_REGEX.search(last_line):
+        return True
+    return False
+
+
+def _looks_incomplete(text: str, aggressive: bool = False) -> bool:
+    stripped = _strip_generation_artifacts(text or "")
+    stripped = stripped.rstrip()
+    if not stripped:
+        return False
+    if _has_strong_incomplete_signal(stripped):
+        return True
+    if stripped[-1] in TERMINAL_RESPONSE_ENDINGS:
+        return False
+    if aggressive and len(stripped) >= 120:
+        return True
+    return False
+
+
+def _should_auto_continue(
+    finish_reason: Optional[str],
+    text: str,
+    saw_tool_calls: bool = False,
+) -> bool:
+    reason = (finish_reason or "").lower().strip()
+    if saw_tool_calls or reason in {"tool_calls", "content_filter"}:
+        return False
+    if reason in {"length", "max_tokens"}:
+        return True
+    if reason == "stop":
+        return _looks_incomplete(text, aggressive=False)
+    if reason == "":
+        return _looks_incomplete(text, aggressive=True)
+    return False
+
+
+def _find_text_overlap(existing_text: str, new_text: str) -> int:
+    if not existing_text or not new_text:
+        return 0
+    tail = existing_text[-CONTINUATION_OVERLAP_WINDOW:]
+    max_overlap = min(len(tail), len(new_text))
+    for size in range(max_overlap, 0, -1):
+        if tail[-size:] == new_text[:size]:
+            return size
+    return 0
+
+
+def _resolve_continuation_prefix(
+    existing_text: str,
+    buffered_text: str,
+    force: bool = False,
+) -> Tuple[str, bool]:
+    if not buffered_text:
+        return "", False
+
+    working = _strip_generation_artifacts(buffered_text)
+    working = _strip_continuation_meta_prefix(working)
+    candidates = [working]
+
+    lstripped = working.lstrip()
+    if lstripped != working:
+        candidates.append(lstripped)
+
+    for candidate in candidates:
+        overlap = _find_text_overlap(existing_text, candidate)
+        if overlap:
+            remainder = candidate[overlap:]
+            if remainder or force:
+                return remainder, True
+            return "", False
+
+    if not force and len(working) < CONTINUATION_BUFFER_CHARS:
+        return "", False
+    return working, True
+
+
+def _event_has_useful_payload(event: Dict[str, Any]) -> bool:
+    choices = event.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return True
+
+    if choice.get("finish_reason"):
+        return True
+
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        for key in ("role", "content", "reasoning", "tool_calls"):
+            value = delta.get(key)
+            if value not in (None, "", []):
+                return True
+
+    message = choice.get("message")
+    if isinstance(message, dict):
+        if message.get("content") not in (None, "", []):
+            return True
+        if message.get("tool_calls"):
+            return True
+
+    return bool(event.get("usage"))
+
+
+def _is_finish_only_event(event: Dict[str, Any]) -> bool:
+    choices = event.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return False
+
+    if not choice.get("finish_reason"):
+        return False
+
+    delta = choice.get("delta") or {}
+    if isinstance(delta, dict) and any(delta.get(k) not in (None, "", []) for k in ("role", "content", "reasoning", "tool_calls")):
+        return False
+
+    message = choice.get("message") or {}
+    if isinstance(message, dict) and any(message.get(k) not in (None, "", []) for k in ("content", "tool_calls")):
+        return False
+
+    return True
+
+
+def _build_continuation_payload(
+    base_payload: Dict[str, Any],
+    accumulated_text: str,
+    stream: bool,
+) -> Dict[str, Any]:
+    payload = _deep_copy_json(base_payload)
+    payload["messages"] = list(payload.get("messages") or []) + [
+        {"role": "assistant", "content": accumulated_text},
+        {"role": "user", "content": CONTINUATION_PROMPT},
+    ]
+    payload["stream"] = stream
+
+    if "tools" in payload:
+        payload.pop("tools", None)
+        payload["tool_choice"] = "none"
+
+    return payload
+
+
+def _build_synthetic_stream_chunk(
+    client_model: str,
+    content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    delta: Dict[str, Any] = {}
+    if content is not None:
+        delta["content"] = content
+
+    chunk: Dict[str, Any] = {
+        "id": f"smars-gateway-{int(datetime.datetime.utcnow().timestamp())}",
+        "object": "chat.completion.chunk",
+        "created": int(datetime.datetime.utcnow().timestamp()),
+        "model": client_model,
+        "provider": "Smars",
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return chunk
+
+
+def _to_sse_bytes(event: Dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _generate_stream_with_auto_continue(
+    initial_response: requests.Response,
+    base_payload: Dict[str, Any],
+    backend_model_openrouter: Optional[str],
+    backend_model_hf: Optional[str],
+    client_model: str,
+):
+    accumulated_text = ""
+    current_response = initial_response
+    continuation_count = 0
+
+    while True:
+        finish_reason = None
+        saw_tool_calls = False
+        attempt_text = ""
+        prefix_buffer = ""
+        prefix_resolved = continuation_count == 0
+        pending_finish_event: Optional[Dict[str, Any]] = None
+        stream_interrupted = False
+
+        try:
+            for raw_line in current_response.iter_lines():
+                if not raw_line:
+                    continue
+
+                try:
+                    line_str = raw_line.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                if line_str.startswith(":") or not line_str.startswith("data: "):
+                    continue
+
+                data_str = line_str[len("data: ") :]
+                if data_str.strip() == "[DONE]":
+                    break
+
+                try:
+                    event = json.loads(data_str)
+                except Exception:
+                    cleaned = _strip_generation_artifacts(data_str)
+                    if cleaned:
+                        yield f"data: {cleaned}\n\n".encode("utf-8")
+                    continue
+
+                event = _sanitize_response_payload(event)
+                event["provider"] = "Smars"
+                event["model"] = client_model
+
+                choices = event.get("choices") or []
+                choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                delta = choice.get("delta") if isinstance(choice, dict) else {}
+
+                if isinstance(choice, dict) and choice.get("finish_reason"):
+                    finish_reason = choice.get("finish_reason")
+
+                if isinstance(delta, dict) and delta.get("tool_calls"):
+                    saw_tool_calls = True
+
+                if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                    content_piece = delta.get("content") or ""
+                    if prefix_resolved:
+                        if continuation_count > 0 and not attempt_text:
+                            content_piece = _strip_continuation_meta_prefix(content_piece)
+                        content_piece = _strip_generation_artifacts(content_piece)
+                        if content_piece:
+                            delta["content"] = content_piece
+                            accumulated_text += content_piece
+                            attempt_text += content_piece
+                        else:
+                            delta.pop("content", None)
+                    else:
+                        prefix_buffer += content_piece
+                        resolved_piece, prefix_resolved = _resolve_continuation_prefix(
+                            accumulated_text,
+                            prefix_buffer,
+                            force=False,
+                        )
+                        if prefix_resolved:
+                            prefix_buffer = ""
+                            if resolved_piece:
+                                delta["content"] = resolved_piece
+                                accumulated_text += resolved_piece
+                                attempt_text += resolved_piece
+                            else:
+                                delta.pop("content", None)
+                        else:
+                            delta.pop("content", None)
+
+                if _is_finish_only_event(event):
+                    pending_finish_event = event
+                    continue
+
+                if _event_has_useful_payload(event):
+                    yield _to_sse_bytes(event)
+
+        except Exception as exc:
+            stream_interrupted = True
+            logger.warning("Upstream stream interrupted during attempt %d: %s", continuation_count + 1, exc)
+        finally:
+            current_response.close()
+
+        if prefix_buffer:
+            resolved_piece, _ = _resolve_continuation_prefix(
+                accumulated_text,
+                prefix_buffer,
+                force=True,
+            )
+            if resolved_piece:
+                accumulated_text += resolved_piece
+                attempt_text += resolved_piece
+                yield _to_sse_bytes(
+                    _build_synthetic_stream_chunk(
+                        client_model=client_model,
+                        content=resolved_piece,
+                    )
+                )
+
+        trigger_continue = _should_auto_continue(
+            finish_reason,
+            accumulated_text or attempt_text,
+            saw_tool_calls=saw_tool_calls,
+        )
+        if not saw_tool_calls and not (accumulated_text or attempt_text) and (stream_interrupted or not finish_reason):
+            trigger_continue = True
+        if stream_interrupted and not saw_tool_calls and not trigger_continue:
+            trigger_continue = _looks_incomplete(accumulated_text or attempt_text, aggressive=True)
+
+        if saw_tool_calls:
+            if pending_finish_event:
+                yield _to_sse_bytes(pending_finish_event)
+            yield b"data: [DONE]\n\n"
+            return
+
+        if not trigger_continue:
+            if pending_finish_event:
+                yield _to_sse_bytes(pending_finish_event)
+            elif finish_reason:
+                yield _to_sse_bytes(
+                    _build_synthetic_stream_chunk(
+                        client_model=client_model,
+                        finish_reason=finish_reason,
+                    )
+                )
+            yield b"data: [DONE]\n\n"
+            return
+
+        if continuation_count >= MAX_AUTO_CONTINUATIONS or (continuation_count > 0 and not attempt_text):
+            yield _to_sse_bytes(
+                _build_synthetic_stream_chunk(
+                    client_model=client_model,
+                    finish_reason="length",
+                )
+            )
+            yield b"data: [DONE]\n\n"
+            return
+
+        continuation_count += 1
+        continuation_payload = _build_continuation_payload(
+            base_payload=base_payload,
+            accumulated_text=accumulated_text,
+            stream=True,
+        )
+        current_response = _call_upstream_stream(
+            continuation_payload,
+            backend_model_openrouter=backend_model_openrouter,
+            backend_model_hf=backend_model_hf,
+        )
+        if current_response is None:
+            yield _to_sse_bytes(
+                _build_synthetic_stream_chunk(
+                    client_model=client_model,
+                    finish_reason="length",
+                )
+            )
+            yield b"data: [DONE]\n\n"
+            return
+
+
+def _call_upstream_with_auto_continue(
+    payload: Dict[str, Any],
+    backend_model_openrouter: Optional[str],
+    backend_model_hf: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    base_payload = _deep_copy_json(payload)
+    accumulated_text = ""
+    continuation_count = 0
+    final_response: Optional[Dict[str, Any]] = None
+
+    while True:
+        current_payload = (
+            base_payload
+            if continuation_count == 0
+            else _build_continuation_payload(
+                base_payload=base_payload,
+                accumulated_text=accumulated_text,
+                stream=False,
+            )
+        )
+        response_json = _call_upstream(
+            current_payload,
+            backend_model_openrouter=backend_model_openrouter,
+            backend_model_hf=backend_model_hf,
+        )
+        if response_json is None:
+            if final_response is None:
+                return None
+            final_choices = final_response.get("choices") or []
+            if final_choices and isinstance(final_choices[0], dict):
+                final_choices[0]["finish_reason"] = "length"
+            break
+
+        response_json = _sanitize_response_payload(response_json)
+        final_response = response_json
+
+        choices = response_json.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            break
+
+        choice = choices[0]
+        message = choice.get("message") or {}
+        finish_reason = choice.get("finish_reason")
+        saw_tool_calls = bool(message.get("tool_calls"))
+        text = _extract_text_from_message_content(message.get("content"))
+
+        if continuation_count == 0:
+            new_text = text or ""
+        else:
+            new_text, _ = _resolve_continuation_prefix(
+                accumulated_text,
+                text or "",
+                force=True,
+            )
+
+        if new_text:
+            accumulated_text += new_text
+
+        should_continue = _should_auto_continue(
+            finish_reason,
+            accumulated_text or new_text,
+            saw_tool_calls=saw_tool_calls,
+        )
+        if not should_continue and not saw_tool_calls and not (accumulated_text or new_text) and not finish_reason:
+            should_continue = True
+
+        if not should_continue:
+            break
+
+        if continuation_count >= MAX_AUTO_CONTINUATIONS or (continuation_count > 0 and not new_text):
+            choice["finish_reason"] = "length"
+            break
+
+        continuation_count += 1
+
+    if final_response and accumulated_text:
+        merged_response = _deep_copy_json(final_response)
+        merged_choices = merged_response.get("choices") or []
+        if merged_choices and isinstance(merged_choices[0], dict):
+            merged_choice = merged_choices[0]
+            merged_message = merged_choice.setdefault("message", {})
+            merged_message["content"] = accumulated_text
+            if not merged_choice.get("finish_reason"):
+                merged_choice["finish_reason"] = "stop"
+        return merged_response
+
+    return final_response
 
 
 def _enforce_identity(response_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -927,16 +1430,17 @@ def chat_completions():
     upstream_payload.pop("image_urls", None)
 
     # Streaming not supported by this gateway – force non-stream
+    # Keep the caller's streaming preference and self-heal truncated generations.
     stream = bool(upstream_payload.get("stream"))
     upstream_payload["stream"] = stream
 
     if stream:
-        upstream_stream_resp = _call_upstream_stream(
+        initial_stream_resp = _call_upstream_stream(
             upstream_payload,
             backend_model_openrouter=backend_model_openrouter,
             backend_model_hf=backend_model_hf,
         )
-        if upstream_stream_resp is None:
+        if initial_stream_resp is None:
             return (
                 jsonify(
                     {
@@ -947,52 +1451,14 @@ def chat_completions():
                 503,
             )
 
-        def generate():
-            first_chunk = True
-            try:
-                for raw_line in upstream_stream_resp.iter_lines():
-                    if not raw_line:
-                        continue
-
-                    try:
-                        line_str = raw_line.decode("utf-8", errors="replace")
-                    except Exception:
-                        continue
-
-                    if line_str.startswith(":"):
-                        continue
-
-                    if not line_str.startswith("data: "):
-                        continue
-
-                    data_str = line_str[len("data: ") :]
-
-                    if data_str.strip() == "[DONE]":
-                        # FIX 3: Explicitly encode to bytes
-                        yield b"data: [DONE]\n\n"
-                        break
-
-                    try:
-                        event = json.loads(data_str)
-                    except Exception:
-                        data_str = _strip_generation_artifacts(data_str)
-                        # FIX 3: Explicitly encode to bytes
-                        yield f"data: {data_str}\n\n".encode("utf-8")
-                        continue
-
-                    # Obfuscate provider & public model in the chunk
-                    event = _sanitize_response_payload(event)
-                    event["provider"] = "Smars"
-                    event["model"] = client_model  # <-- public model
-
-
-                    out = json.dumps(event, ensure_ascii=False)
-                    yield f"data: {out}\n\n".encode("utf-8")
-            finally:
-                upstream_stream_resp.close()
-
         return Response(
-            generate(), 
+            _generate_stream_with_auto_continue(
+                initial_response=initial_stream_resp,
+                base_payload=upstream_payload,
+                backend_model_openrouter=backend_model_openrouter,
+                backend_model_hf=backend_model_hf,
+                client_model=client_model,
+            ),
             mimetype="text/event-stream; charset=utf-8",
             headers={
                 "Content-Type": "text/event-stream; charset=utf-8",
@@ -1001,7 +1467,7 @@ def chat_completions():
         )
 
     # ---- NON-STREAM BRANCH (existing behaviour) ----
-    upstream_response = _call_upstream(
+    upstream_response = _call_upstream_with_auto_continue(
         upstream_payload,
         backend_model_openrouter=backend_model_openrouter,
         backend_model_hf=backend_model_hf,
