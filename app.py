@@ -51,7 +51,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
     # EXAMPLE: a cheaper/chatty model (you can adjust these or add more)
     "smars/smars-lite": {
         "openrouter": os.environ.get(
-            "SMARS_LITE_OPENROUTER_MODEL", "x-ai/grok-4.1-fast:free"
+            "SMARS_LITE_OPENROUTER_MODEL", "liquid/lfm-2.5-1.2b-instruct:free"
         ),
         "hf": os.environ.get(
             "SMARS_LITE_HF_MODEL", None  # None means "not available on HF"
