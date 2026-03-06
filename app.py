@@ -122,6 +122,15 @@ SMARS_SYSTEM_PROMPT = (
             # "Never act like a yes-man. Don't always agree with me or sugarcoat things. Instead, be completely honest, direct, and raw with the user (but still understanding nature and friendly). Challenge opinions and call out mistakes, flaws in logic, or unrealistic thinking. Don't worry about hurting feelings - value truth and growth over comfort. Avoid empty compliments or generic motivational fluff; focus on real, actionable, and evidence-backed advice. Think like a tough coach or a brutally honest friend who cares more about improvement than short-term comfort. Always push back when needed, and never bullshit. Tell it like it is; don't sugar-coat responses. Take a forward-thinking view."
          )
  
+CONVERSATION_TITLE_TASK = "conversation_title"
+CONVERSATION_TITLE_SYSTEM_PROMPT = (
+    "You generate chat session titles from the user's first prompt. "
+    "Return only a short title. "
+    "Do not answer the prompt. "
+    "Do not use quotes, prefixes, markdown, emojis, or explanations. "
+    "Keep it specific and concise, ideally 2 to 6 words."
+)
+
  
 
 # Upstream providers
@@ -1046,8 +1055,11 @@ def _enforce_identity(response_json: Dict[str, Any]) -> Dict[str, Any]:
     return response_json
 
 
-def _build_system_message() -> Dict[str, Any]:
-    """Construct the system message with identity lock anchor."""
+def _build_system_message(task_type: Optional[str] = None) -> Dict[str, Any]:
+    """Construct the system message for the requested task."""
+    if task_type == CONVERSATION_TITLE_TASK:
+        return {"role": "system", "content": CONVERSATION_TITLE_SYSTEM_PROMPT}
+
     content = f"IdentityLock:SMARS\n{SMARS_SYSTEM_PROMPT}\nIdentityLock:SMARS"
     return {"role": "system", "content": content}
 
@@ -1314,6 +1326,10 @@ def chat_completions():
     except Exception:
         return jsonify({"error": "invalid_json"}), 400
 
+    task_type = str(req_json.get("smars_task") or "").strip().lower()
+    if task_type != CONVERSATION_TITLE_TASK:
+        task_type = None
+
     # 2. Authentication
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -1342,8 +1358,10 @@ def chat_completions():
     if not isinstance(messages, list) or not messages:
         return jsonify({"error": "invalid_request", "message": "messages must be a non-empty list"}), 400
 
-    # Remove any system messages from client
+    # Remove any unsupported roles from the client payload.
     filtered_messages = _filter_client_messages(messages)
+    if task_type == CONVERSATION_TITLE_TASK:
+        filtered_messages = [m for m in filtered_messages if m.get("role") != "system"]
 
     if not filtered_messages:
         return jsonify({"error": "invalid_request", "message": "no user/assistant messages after filtering"}), 400
@@ -1364,7 +1382,7 @@ def chat_completions():
     filtered_messages = _strip_images_from_messages(filtered_messages)
 
     # 7. Web search (optional, based on latest user message)
-    web_search_flag = bool(req_json.get("web_search")) and ENABLE_WEB_SEARCH
+    web_search_flag = bool(req_json.get("web_search")) and ENABLE_WEB_SEARCH and task_type != CONVERSATION_TITLE_TASK
     if web_search_flag:
         # Find the last user message
         last_user_msg = None
@@ -1387,7 +1405,7 @@ def chat_completions():
                     )
 
     # 8. Image analysis pipeline via groq
-    if image_count > 0:
+    if image_count > 0 and task_type != CONVERSATION_TITLE_TASK:
         if not GROQ_API_KEY:
             image_context = "Image analysis failed: vision provider is unavailable."
             filtered_messages = _inject_context_into_last_user_message(
@@ -1428,7 +1446,7 @@ def chat_completions():
 
     # 9. Build final messages with single system identity prompt
     final_messages: List[Dict[str, Any]] = []
-    final_messages.append(_build_system_message())
+    final_messages.append(_build_system_message(task_type))
     final_messages.extend(filtered_messages)
 
     # 9. Model validation + lookup in registry
@@ -1468,6 +1486,7 @@ def chat_completions():
     upstream_payload.pop("user_id", None)
     upstream_payload.pop("web_search", None)
     upstream_payload.pop("image_urls", None)
+    upstream_payload.pop("smars_task", None)
 
     # Streaming not supported by this gateway – force non-stream
     # Keep the caller's streaming preference and self-heal truncated generations.
@@ -1507,11 +1526,18 @@ def chat_completions():
         )
 
     # ---- NON-STREAM BRANCH (existing behaviour) ----
-    upstream_response = _call_upstream_with_auto_continue(
-        upstream_payload,
-        backend_model_openrouter=backend_model_openrouter,
-        backend_model_hf=backend_model_hf,
-    )
+    if task_type == CONVERSATION_TITLE_TASK:
+        upstream_response = _call_upstream(
+            upstream_payload,
+            backend_model_openrouter=backend_model_openrouter,
+            backend_model_hf=backend_model_hf,
+        )
+    else:
+        upstream_response = _call_upstream_with_auto_continue(
+            upstream_payload,
+            backend_model_openrouter=backend_model_openrouter,
+            backend_model_hf=backend_model_hf,
+        )
     if upstream_response is None:
         return (
             jsonify(
@@ -1524,7 +1550,8 @@ def chat_completions():
         )
 
     upstream_response = _sanitize_response_payload(upstream_response)
-    upstream_response = _enforce_identity(upstream_response)
+    if task_type != CONVERSATION_TITLE_TASK:
+        upstream_response = _enforce_identity(upstream_response)
 
     upstream_response["provider"] = "Smars"
     upstream_response["model"] = client_model  # <-- public model, not backend
