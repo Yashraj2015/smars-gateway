@@ -40,6 +40,7 @@ logger = logging.getLogger("smars-gateway")
 MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
     # Your existing DeepSeek V3.1 mapping
     "smars/smars-1": {
+        "mode": "chat",
         "openrouter": os.environ.get(
             "SMARS_S1_OPENROUTER_MODEL", "deepseek/deepseek-v3.2"
         ),
@@ -50,6 +51,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
 
     # EXAMPLE: a cheaper/chatty model (you can adjust these or add more)
     "smars/smars-lite": {
+        "mode": "chat",
         "openrouter": os.environ.get(
             "SMARS_LITE_OPENROUTER_MODEL", "arcee-ai/trinity-large-preview:free"
         ),
@@ -59,6 +61,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
     },
 
     "smars/smars-embedding": {
+        "mode": "embeddings",
         "openrouter": os.environ.get(
             "SMARS_EMBEDDING_OPENROUTER_MODEL", "qwen/qwen3-embedding-8b"
         ),
@@ -144,6 +147,9 @@ OPENROUTER_KEYS = [
     for k in os.environ.get("OPENROUTER_KEYS", "").split(",")
     if k.strip()
 ]
+OPENROUTER_API_BASE = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER")
+OPENROUTER_TITLE = os.environ.get("OPENROUTER_TITLE")
 HUGGINGFACE_KEYS = [
     k.strip()
     for k in os.environ.get("HUGGINGFACE_KEYS", "").split(",")
@@ -202,6 +208,8 @@ CONTINUATION_META_PREFIX_REGEX = re.compile(
 )
 BOLD_MARKER_REGEX = re.compile(r"(?<!\*)\*\*(?!\*)|(?<!_)__(?!_)")
 INLINE_CODE_MARKER_REGEX = re.compile(r"(?<!`)`(?!`)")
+CHAT_MODEL_MODE = "chat"
+EMBEDDING_MODEL_MODE = "embeddings"
 
 
 # ---------------------------------------------------------
@@ -229,6 +237,41 @@ def _get_user_id(req_json: Dict[str, Any]) -> Optional[str]:
     if user_id:
         return str(user_id)
     return str(req_json.get("user_id")) if req_json.get("user_id") else None
+
+
+def _authenticate_smars_api_key() -> Optional[str]:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    api_key = auth_header.split(" ", 1)[1].strip()
+    if api_key not in SMARS_API_KEYS:
+        return None
+    return api_key
+
+
+def _get_model_mode(model_info: Dict[str, Optional[str]]) -> str:
+    return str(model_info.get("mode") or CHAT_MODEL_MODE).strip().lower()
+
+
+def _build_openrouter_headers(api_key: str) -> Dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    http_referer = (
+        request.headers.get("HTTP-Referer")
+        or request.headers.get("Referer")
+        or OPENROUTER_HTTP_REFERER
+    )
+    title = request.headers.get("X-OpenRouter-Title") or OPENROUTER_TITLE
+
+    if http_referer:
+        headers["HTTP-Referer"] = http_referer
+    if title:
+        headers["X-OpenRouter-Title"] = title
+
+    return headers
 
 
 
@@ -1165,13 +1208,10 @@ def _call_upstream_stream(
     # ... [OpenRouter Logic remains exactly the same] ...
     # 1. Try OpenRouter (Max 5 keys)
     if OPENROUTER_KEYS and backend_model_openrouter:
-        url = "https://openrouter.ai/api/v1/chat/completions"
+        url = f"{OPENROUTER_API_BASE.rstrip('/')}/chat/completions"
         for idx, key in enumerate(OPENROUTER_KEYS[:5]):
             try:
-                headers = {
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                }
+                headers = _build_openrouter_headers(key)
                 body = dict(payload)
                 body["model"] = backend_model_openrouter
 
@@ -1243,13 +1283,10 @@ def _call_upstream_openrouter(
         # This public model has no OpenRouter backend mapping
         return None
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = f"{OPENROUTER_API_BASE.rstrip('/')}/chat/completions"
     for idx, key in enumerate(OPENROUTER_KEYS):
         try:
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            }
+            headers = _build_openrouter_headers(key)
             body = dict(payload)
             body["model"] = backend_model_openrouter
 
@@ -1269,6 +1306,42 @@ def _call_upstream_openrouter(
                 )
         except Exception as e:
             logger.error("Primary provider key #%d error: %s", idx + 1, e)
+    return None
+
+
+def _call_upstream_openrouter_embeddings(
+    payload: Dict[str, Any],
+    backend_model_openrouter: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not OPENROUTER_KEYS:
+        return None
+    if not backend_model_openrouter:
+        return None
+
+    url = f"{OPENROUTER_API_BASE.rstrip('/')}/embeddings"
+    for idx, key in enumerate(OPENROUTER_KEYS):
+        try:
+            headers = _build_openrouter_headers(key)
+            body = dict(payload)
+            body["model"] = backend_model_openrouter
+            body.setdefault("encoding_format", "float")
+
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=UPSTREAM_NON_STREAM_TIMEOUT_SECONDS,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+
+            logger.warning(
+                "OpenRouter embeddings key #%d returned status %s",
+                idx + 1,
+                resp.status_code,
+            )
+        except Exception as e:
+            logger.error("OpenRouter embeddings key #%d error: %s", idx + 1, e)
     return None
 
 
@@ -1342,6 +1415,101 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/v1/embeddings", methods=["POST"])
+def embeddings():
+    try:
+        req_json = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid_json"}), 400
+
+    api_key = _authenticate_smars_api_key()
+    if not api_key:
+        return jsonify({"error": "unauthorized"}), 401
+
+    client_model = req_json.get("model")
+    if not client_model:
+        return (
+            jsonify(
+                {
+                    "error": "model_required",
+                    "message": "You must specify a model.",
+                    "available_models": list(MODEL_REGISTRY.keys()),
+                }
+            ),
+            400,
+        )
+
+    model_info = MODEL_REGISTRY.get(client_model)
+    if not model_info:
+        return (
+            jsonify(
+                {
+                    "error": "model_not_available",
+                    "allowed_models": list(MODEL_REGISTRY.keys()),
+                }
+            ),
+            400,
+        )
+
+    if _get_model_mode(model_info) != EMBEDDING_MODEL_MODE:
+        return (
+            jsonify(
+                {
+                    "error": "unsupported_operation",
+                    "message": "This model must be used with /v1/chat/completions.",
+                    "model": client_model,
+                }
+            ),
+            400,
+        )
+
+    if "input" not in req_json:
+        return (
+            jsonify(
+                {
+                    "error": "invalid_request",
+                    "message": "input is required for embeddings requests.",
+                }
+            ),
+            400,
+        )
+
+    upstream_payload: Dict[str, Any] = dict(req_json)
+    upstream_payload.pop("user_id", None)
+    upstream_payload.pop("messages", None)
+    upstream_payload.pop("image_urls", None)
+    upstream_payload.pop("web_search", None)
+    upstream_payload.pop("smars_task", None)
+    upstream_payload.pop("stream", None)
+    encoding_format = (
+        str(upstream_payload.get("encoding_format")).strip()
+        if upstream_payload.get("encoding_format") is not None
+        else "float"
+    )
+    upstream_payload["encoding_format"] = encoding_format or "float"
+
+    backend_model_openrouter = model_info.get("openrouter")
+    upstream_response = _call_upstream_openrouter_embeddings(
+        upstream_payload,
+        backend_model_openrouter=backend_model_openrouter,
+    )
+    if upstream_response is None:
+        return (
+            jsonify(
+                {
+                    "error": "upstream_unavailable",
+                    "message": "OpenRouter embeddings provider failed",
+                }
+            ),
+            503,
+        )
+
+    upstream_response["provider"] = "Smars"
+    upstream_response["model"] = client_model
+
+    return jsonify(upstream_response), 200
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     # 1. Parse JSON
@@ -1355,13 +1523,8 @@ def chat_completions():
         task_type = None
 
     # 2. Authentication
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return jsonify({"error": "unauthorized"}), 401
-
-    api_key = auth_header.split(" ", 1)[1].strip()
-
-    if api_key not in SMARS_API_KEYS:
+    api_key = _authenticate_smars_api_key()
+    if not api_key:
         return jsonify({"error": "unauthorized"}), 401
 
     # 3. user_id (required)
@@ -1496,6 +1659,18 @@ def chat_completions():
                 {
                     "error": "model_not_available",
                     "allowed_models": list(MODEL_REGISTRY.keys()),
+                }
+            ),
+            400,
+        )
+
+    if _get_model_mode(model_info) != CHAT_MODEL_MODE:
+        return (
+            jsonify(
+                {
+                    "error": "unsupported_operation",
+                    "message": "This model only supports /v1/embeddings.",
+                    "model": client_model,
                 }
             ),
             400,
