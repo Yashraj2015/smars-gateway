@@ -58,6 +58,15 @@ MODEL_REGISTRY: Dict[str, Dict[str, Optional[str]]] = {
         ),
     },
 
+    "smars/smars-embedding": {
+        "openrouter": os.environ.get(
+            "SMARS_EMBEDDING_OPENROUTER_MODEL", "qwen/qwen3-embedding-8b"
+        ),
+        "hf": os.environ.get(
+            "SMARS_EMBEDDING_HF_MODEL", None  # None means "not available on HF"
+        ),
+    },
+
     # Add more models here...
     # "smars/smars-coder": { "openrouter": "...", "hf": "..." },
 }
